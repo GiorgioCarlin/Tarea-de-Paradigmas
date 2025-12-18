@@ -2,6 +2,9 @@
 #include <stdlib.h>
 #include <time.h>
 #include <omp.h>
+#include <cuda_runtime.h>
+
+
 
 // Llena una matriz n×n con valores aleatorios
 void llenar_matriz(float *M, int n) {
@@ -21,6 +24,7 @@ void imprimir_matriz(const char *nombre, float *M, int n) {
     }
 }
 
+/* ================= CPU ================= */
 
 // Multiplicación de matrices CPU multicore
 void producto_cpu(float *A, float *B, float *C, int n, int nt) {
@@ -37,6 +41,25 @@ void producto_cpu(float *A, float *B, float *C, int n, int nt) {
     }
 }
 
+/* ================= GPU ================= */
+
+// Kernel GPU básico (memoria global)
+__global__ void producto_gpu(float *A, float *B, float *C, int n) {
+
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < n && col < n) {
+        float suma = 0.0f;
+        for (int k = 0; k < n; k++) {
+            suma += A[row * n + k] * B[k * n + col];
+        }
+        C[row * n + col] = suma;
+    }
+}
+
+/* ================= MAIN ================= */
+
 int main(int argc, char *argv[]) {
 
     if (argc != 4) {
@@ -44,9 +67,9 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    int n   = atoi(argv[1]);
-    int nt  = atoi(argv[2]);
-    int ALG = atoi(argv[3]);
+    int n   = atoi(argv[1]);  // tamaño matriz
+    int nt  = atoi(argv[2]);  // threads CPU
+    int ALG = atoi(argv[3]);  // algoritmo
 
     printf("n   = %d\n", n);
     printf("nt  = %d\n", nt);
@@ -54,24 +77,24 @@ int main(int argc, char *argv[]) {
 
     srand(time(NULL));
 
-    // Reservar memoria
-    float *A = (float*) malloc(n * n * sizeof(float));
-    float *B = (float*) malloc(n * n * sizeof(float));
-    float *C = (float*) malloc(n * n * sizeof(float));
+    size_t size = n * n * sizeof(float);
+
+    float *A = (float*) malloc(size);
+    float *B = (float*) malloc(size);
+    float *C = (float*) malloc(size);
 
     if (!A || !B || !C) {
         printf("Error al reservar memoria\n");
         return 1;
     }
 
-    // LLENAR MATRICES
     llenar_matriz(A, n);
     llenar_matriz(B, n);
 
-    // Ejecutar algoritmos
+    /* ================= CPU ================= */
 
-    //CPU
     if (ALG == 1) {
+
         printf("\nEjecutando producto matricial CPU multicore...\n");
 
         double t_inicio = omp_get_wtime();
@@ -79,33 +102,80 @@ int main(int argc, char *argv[]) {
         double t_fin = omp_get_wtime();
 
         double tiempo = t_fin - t_inicio;
-
         printf("Tiempo CPU: %f segundos\n", tiempo);
 
-        // Guardar resultados en archivo
         FILE *f = fopen("resultados_cpu.txt", "a");
-        if (f != NULL) {
-            fprintf(f, "%d %d %f\n", n, nt, tiempo);
+        if (f) {
+            fprintf(f, "%d %f\n", n, tiempo);
             fclose(f);
-        } else {
-            printf("No se pudo abrir el archivo de resultados\n");
         }
     }
-    //GPU
+
+    /* ================= GPU ================= */
+
     else if (ALG == 2) {
-        printf("\nEl producto en GPU aun no esta implementado...\n");
-       
-    } 
-    //GPUsm
-    else if (ALG == 3) {
-        printf("\nEl producto en GPUsm aun no esta implementado...\n");
-        
-    } else {
-        printf("\nALG incorrecto, debe ser igual a 1, 2 o 3.\n");
+
+        printf("\nEjecutando producto matricial GPU (basico)...\n");
+
+        float *d_A, *d_B, *d_C;
+
+        cudaMalloc((void**)&d_A, size);
+        cudaMalloc((void**)&d_B, size);
+        cudaMalloc((void**)&d_C, size);
+
+        cudaMemcpy(d_A, A, size, cudaMemcpyHostToDevice);
+        cudaMemcpy(d_B, B, size, cudaMemcpyHostToDevice);
+
+        dim3 block(16, 16);
+        dim3 grid((n + block.x - 1) / block.x,
+                  (n + block.y - 1) / block.y);
+
+        cudaEvent_t start, stop;
+        cudaEventCreate(&start);
+        cudaEventCreate(&stop);
+
+        cudaEventRecord(start);
+        producto_gpu<<<grid, block>>>(d_A, d_B, d_C, n);
+        cudaEventRecord(stop);
+        cudaEventSynchronize(stop);
+
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            printf("Error CUDA: %s\n", cudaGetErrorString(err));
+        }
+
+        float tiempo_ms;
+        cudaEventElapsedTime(&tiempo_ms, start, stop);
+        printf("Tiempo GPU: %f ms\n", tiempo_ms);
+
+        cudaMemcpy(C, d_C, size, cudaMemcpyDeviceToHost);
+
+        FILE *f = fopen("resultados_gpu.txt", "a");
+        if (f) {
+            fprintf(f, "%d %f\n", n, tiempo_ms / 1000.0);
+            fclose(f);
+        }
+
+        cudaFree(d_A);
+        cudaFree(d_B);
+        cudaFree(d_C);
+        cudaEventDestroy(start);
+        cudaEventDestroy(stop);
     }
 
-    // Imprimir solo si es pequeño
-    if (n <= 8 && ALG == 1) {
+    /* ================= GPU SM ================= */
+
+    else if (ALG == 3) {
+        printf("\nGPU con memoria compartida aun no implementado.\n");
+    }
+
+    else {
+        printf("\nALG incorrecto, debe ser 1, 2 o 3.\n");
+    }
+
+    /* ================= DEBUG ================= */
+
+    if (n <= 8) {
         imprimir_matriz("A", A, n);
         imprimir_matriz("B", B, n);
         imprimir_matriz("C", C, n);
