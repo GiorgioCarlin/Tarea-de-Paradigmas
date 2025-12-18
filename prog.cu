@@ -5,7 +5,6 @@
 #include <cuda_runtime.h>
 
 
-
 // Llena una matriz n×n con valores aleatorios
 void llenar_matriz(float *M, int n) {
     for (int i = 0; i < n * n; i++) {
