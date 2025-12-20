@@ -1,7 +1,3 @@
-// matmul.cu - Multiplicación de matrices en CUDA
-// Versiones: CPU multicore, GPU básica, GPU con memoria compartida
-// Uso: ./prog <n> <nt> <ALG>
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
