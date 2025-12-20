@@ -8,19 +8,6 @@ Implementación del producto de matrices cuadradas en CUDA con 3 versiones:
 
 **Nota**: Todas las versiones se ejecutan con `srun`
 
-## Estructura
-
-matmul_COMPA/
-
-
-matmul.cu # Código fuente
-
-
-Makefile # Compilación
-
-
-README.md # Este archivo
-
 ## Compilación
 
 make clean 
