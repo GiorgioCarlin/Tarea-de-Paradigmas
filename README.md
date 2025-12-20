@@ -10,24 +10,30 @@ Implementación del producto de matrices cuadradas en CUDA con 3 versiones:
 
 ## Estructura
 matmul_COMPA/
-├── matmul.cu # Código fuente
-├── Makefile # Compilación
-└── README.md # Este archivo
+matmul.cu # Código fuente
+
+
+Makefile # Compilación
+
+
+README.md # Este archivo
 
 ## Compilación
 
 make clean 
+
+
 make
 
 ## Uso
 
-# CPU multicore (8 threads)
+### CPU multicore (8 threads)
 srun -p A4000 --gpus=1 --container-name=cuda --container-workdir=${PWD} ./prog <n> 8 1
 
-# GPU básica
+### GPU básica
 srun -p A4000 --gpus=1 --container-name=cuda --container-workdir=${PWD} ./prog <n> 1 2
 
-# GPU con memoria compartida
+### GPU con memoria compartida
 srun -p A4000 --gpus=1 --container-name=cuda --container-workdir=${PWD} ./prog <n> 1 3
 Parámetros:
 
