@@ -1,223 +1,261 @@
+// matmul.cu - Multiplicación de matrices en CUDA
+// Versiones: CPU multicore, GPU básica, GPU con memoria compartida
+// Uso: ./prog <n> <nt> <ALG>
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
-#include <sys/time.h>
-
-// Inclusión del runtime de CUDA
+#include <math.h>
+#include <omp.h>
 #include <cuda_runtime.h>
 
-// Tamaño de tile para el kernel con memoria compartida
-#define TILE 16
+// Tamaño de tile para memoria compartida
+#define TILE_SIZE 16
 
-// Macro simple para comprobar errores de llamadas CUDA
-#define CUDA_CHECK(call)                                                      \
-    do {                                                                      \
-        cudaError_t e = (call);                                               \
-        if (e != cudaSuccess) {                                               \
-            fprintf(stderr, "CUDA error %s:%d: %s\n", __FILE__, __LINE__,  \
-                    cudaGetErrorString(e));                                  \
-            exit(EXIT_FAILURE);                                               \
-        }                                                                     \
-    } while (0)
+// Macro para verificar errores CUDA
+#define CUDA_CHECK(call) \
+    do { \
+        cudaError_t err = (call); \
+        if (err != cudaSuccess) { \
+            fprintf(stderr, "CUDA error at %s:%d: %s\n", \
+                    __FILE__, __LINE__, cudaGetErrorString(err)); \
+            exit(EXIT_FAILURE); \
+        } \
+    } while(0)
 
-// Rellenar matriz con flotantes aleatorios en [0,9]
+// ==================== FUNCIONES AUXILIARES ====================
+
 void llenar_matriz(float *M, int n) {
-    for (int i = 0; i < n * n; ++i) M[i] = (float)(rand() % 10);
-}
-
-// Imprimir matriz (muestra hasta 8x8 para evitar salida demasiado grande)
-void imprimir_matriz(const char* nombre, float *M, int n) {
-    int lim = (n < 8) ? n : 8;
-    printf("\nMatriz %s (mostrando %dx%d):\n", nombre, lim, lim);
-    for (int i = 0; i < lim; ++i) {
-        for (int j = 0; j < lim; ++j) {
-            printf("%8.2f ", M[i * n + j]);
-        }
-        printf("\n");
+    for (int i = 0; i < n * n; i++) {
+        M[i] = (float)(rand() % 10);
     }
 }
 
-// Multiplicación de matrices de referencia en CPU: C = A * B
-void matmul_cpu(const float *A, const float *B, float *C, int n) {
-    for (int i = 0; i < n; ++i) {
-        for (int j = 0; j < n; ++j) {
-            float sum = 0.0f;
-            for (int k = 0; k < n; ++k) {
-                sum += A[i * n + k] * B[k * n + j];
+int verificar_resultados(float *C1, float *C2, int n, float tolerancia = 1e-3) {
+    int errores = 0;
+    for (int i = 0; i < n*n; i++) {
+        if (fabs(C1[i] - C2[i]) > tolerancia) {
+            errores++;
+            if (errores <= 3) {
+                int fila = i / n;
+                int col = i % n;
+                printf("  Error en [%d,%d]: %.2f vs %.2f\n", 
+                       fila, col, C1[i], C2[i]);
             }
-            C[i * n + j] = sum;
+        }
+    }
+    return errores;
+}
+
+// ==================== CPU MULTICORE ====================
+
+void matmul_cpu_multicore(float *A, float *B, float *C, int n, int nt) {
+    #pragma omp parallel for num_threads(nt) collapse(2)
+    for (int i = 0; i < n; i++) {
+        for (int j = 0; j < n; j++) {
+            float suma = 0.0f;
+            for (int k = 0; k < n; k++) {
+                suma += A[i*n + k] * B[k*n + j];
+            }
+            C[i*n + j] = suma;
         }
     }
 }
 
-// Kernel GPU básico (memoria global) - se usa si ALG==2
-__global__ void matmul_kernel_basic(const float *A, const float *B, float *C, int n) {
-    int row = blockIdx.y * blockDim.y + threadIdx.y;
+// ==================== GPU BÁSICA ====================
+
+__global__ void matmul_gpu_basica(float *A, float *B, float *C, int n) {
+    int fila = blockIdx.y * blockDim.y + threadIdx.y;
     int col = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row < n && col < n) {
-        float sum = 0.0f;
-        for (int k = 0; k < n; ++k) {
-            sum += A[row * n + k] * B[k * n + col];
+    
+    if (fila < n && col < n) {
+        float suma = 0.0f;
+        for (int k = 0; k < n; k++) {
+            suma += A[fila * n + k] * B[k * n + col];
         }
-        C[row * n + col] = sum;
+        C[fila * n + col] = suma;
     }
 }
 
-// Kernel GPU con tiling y memoria compartida (GPUSm / ALG==3)
-__global__ void matmul_kernel_tiled(const float *A, const float *B, float *C, int n) {
-    __shared__ float As[TILE][TILE];
-    __shared__ float Bs[TILE][TILE];
+// ==================== GPU CON MEMORIA COMPARTIDA ====================
 
+__global__ void matmul_gpu_sm(float *A, float *B, float *C, int n) {
+    __shared__ float tileA[TILE_SIZE][TILE_SIZE];
+    __shared__ float tileB[TILE_SIZE][TILE_SIZE];
+    
     int tx = threadIdx.x;
     int ty = threadIdx.y;
-    int row = blockIdx.y * TILE + ty;
-    int col = blockIdx.x * TILE + tx;
-
-    float sum = 0.0f;
-
-    for (int m = 0; m < (n + TILE - 1) / TILE; ++m) {
-        // Cargar un tile de A y B en memoria compartida, con comprobación de límites
-        int aRow = row;
-        int aCol = m * TILE + tx;
-        if (aRow < n && aCol < n) As[ty][tx] = A[aRow * n + aCol];
-        else As[ty][tx] = 0.0f;
-
-        int bRow = m * TILE + ty;
+    
+    int fila = blockIdx.y * TILE_SIZE + ty;
+    int col = blockIdx.x * TILE_SIZE + tx;
+    
+    float suma = 0.0f;
+    
+    for (int m = 0; m < (n + TILE_SIZE - 1) / TILE_SIZE; m++) {
+        int aFila = fila;
+        int aCol = m * TILE_SIZE + tx;
+        if (aFila < n && aCol < n)
+            tileA[ty][tx] = A[aFila * n + aCol];
+        else
+            tileA[ty][tx] = 0.0f;
+        
+        int bFila = m * TILE_SIZE + ty;
         int bCol = col;
-        if (bRow < n && bCol < n) Bs[ty][tx] = B[bRow * n + bCol];
-        else Bs[ty][tx] = 0.0f;
-
+        if (bFila < n && bCol < n)
+            tileB[ty][tx] = B[bFila * n + bCol];
+        else
+            tileB[ty][tx] = 0.0f;
+        
         __syncthreads();
-
-        for (int k = 0; k < TILE; ++k) {
-            sum += As[ty][k] * Bs[k][tx];
+        
+        for (int k = 0; k < TILE_SIZE; k++) {
+            suma += tileA[ty][k] * tileB[k][tx];
         }
+        
         __syncthreads();
     }
-
-    if (row < n && col < n) C[row * n + col] = sum;
-}
-
-// Comparar dos matrices; devuelve el número de discrepancias
-int comparar_matrices(const float *X, const float *Y, int n) {
-    int mismatches = 0;
-    const float eps = 1e-3f;
-    for (int i = 0; i < n * n; ++i) {
-        float a = X[i], b = Y[i];
-        if (fabsf(a - b) > eps) {
-            mismatches++;
-            if (mismatches <= 10) {
-                int r = i / n, c = i % n;
-                printf("Mismatch at (%d,%d): %f vs %f\n", r, c, a, b);
-            }
-        }
+    
+    if (fila < n && col < n) {
+        C[fila * n + col] = suma;
     }
-    return mismatches;
 }
 
-// Obtener el tiempo actual en segundos
-double now_seconds() {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return tv.tv_sec + tv.tv_usec * 1e-6;
-}
+// ==================== FUNCIÓN PRINCIPAL ====================
 
 int main(int argc, char *argv[]) {
     if (argc != 4) {
-        printf("Uso correcto: ./prog <n> <nt> <ALG>\n");
-        printf("ALG: 1=CPU, 2=GPU básico, 3=GPU shared-memory (GPUSm)\n");
+        printf("Uso: ./prog <n> <nt> <ALG>\n");
+        printf("  n   : tamaño matriz\n");
+        printf("  nt  : threads CPU (solo ALG=1)\n");
+        printf("  ALG : 1=CPU, 2=GPU, 3=GPUsm\n");
         return 1;
     }
-
-    int n   = atoi(argv[1]);   // tamaño
-    int nt  = atoi(argv[2]);   // threads CPU (no usado aquí)
-    int ALG = atoi(argv[3]);   // algoritmo
-
-    printf("Parámetros recibidos: n=%d, nt=%d, ALG=%d\n", n, nt, ALG);
-
+    
+    int n = atoi(argv[1]);
+    int nt = atoi(argv[2]);
+    int ALG = atoi(argv[3]);
+    
+    if (ALG < 1 || ALG > 3) {
+        printf("ERROR: ALG debe ser 1, 2 o 3\n");
+        return 1;
+    }
+    
+    // Configuración inicial
     srand(time(NULL));
-
-    size_t bytes = sizeof(float) * n * n;
-    float *A = (float*)malloc(bytes);
-    float *B = (float*)malloc(bytes);
-    float *C_ref = (float*)malloc(bytes);
-    float *C_gpu = (float*)malloc(bytes);
-    if (!A || !B || !C_ref || !C_gpu) {
-        fprintf(stderr, "Error allocating host memory\n");
+    
+    size_t size = n * n * sizeof(float);
+    float *h_A = (float*)malloc(size);
+    float *h_B = (float*)malloc(size);
+    float *h_C = (float*)malloc(size);
+    float *h_C_ref = (float*)malloc(size);
+    
+    if (!h_A || !h_B || !h_C || !h_C_ref) {
+        printf("Error: memoria CPU\n");
         return 1;
     }
-
-    llenar_matriz(A, n);
-    llenar_matriz(B, n);
-
-    imprimir_matriz("A", A, n);
-    imprimir_matriz("B", B, n);
-
-    // Calcular la referencia en CPU (siempre se calcula para verificación y medida)
-    double t0 = now_seconds();
-    matmul_cpu(A, B, C_ref, n);
-    double t1 = now_seconds();
-    printf("CPU time: %.6f s\n", t1 - t0);
-
+    
+    // Rellenar matrices
+    llenar_matriz(h_A, n);
+    llenar_matriz(h_B, n);
+    
+    // Calcular referencia (solo para verificación)
+    double tiempo_ref = 0.0;
+    if (n <= 1024) {
+        double inicio_ref = omp_get_wtime();
+        for (int i = 0; i < n; i++) {
+            for (int j = 0; j < n; j++) {
+                float suma = 0.0f;
+                for (int k = 0; k < n; k++) {
+                    suma += h_A[i*n + k] * h_B[k*n + j];
+                }
+                h_C_ref[i*n + j] = suma;
+            }
+        }
+        tiempo_ref = omp_get_wtime() - inicio_ref;
+    }
+    
+    // Ejecutar algoritmo seleccionado
+    double tiempo_ejecucion = 0.0;
+    
     if (ALG == 1) {
-        // Ya está calculado (solo CPU)
-        imprimir_matriz("C_CPU", C_ref, n);
-        free(A); free(B); free(C_ref); free(C_gpu);
-        return 0;
+        // CPU multicore
+        double inicio = omp_get_wtime();
+        matmul_cpu_multicore(h_A, h_B, h_C, n, nt);
+        tiempo_ejecucion = omp_get_wtime() - inicio;
+        
+        printf("CPU: n=%d, threads=%d, tiempo=%.6f s\n", n, nt, tiempo_ejecucion);
+        
+    } else if (ALG == 2 || ALG == 3) {
+        // Versiones GPU
+        float *d_A, *d_B, *d_C;
+        CUDA_CHECK(cudaMalloc(&d_A, size));
+        CUDA_CHECK(cudaMalloc(&d_B, size));
+        CUDA_CHECK(cudaMalloc(&d_C, size));
+        
+        CUDA_CHECK(cudaMemcpy(d_A, h_A, size, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_B, h_B, size, cudaMemcpyHostToDevice));
+        
+        dim3 block, grid;
+        
+        cudaEvent_t start, stop;
+        CUDA_CHECK(cudaEventCreate(&start));
+        CUDA_CHECK(cudaEventCreate(&stop));
+        
+        CUDA_CHECK(cudaEventRecord(start));
+        
+        if (ALG == 2) {
+            // GPU básica
+            block = dim3(16, 16);
+            grid = dim3((n + block.x - 1) / block.x,
+                       (n + block.y - 1) / block.y);
+            matmul_gpu_basica<<<grid, block>>>(d_A, d_B, d_C, n);
+        } else {
+            // GPU con memoria compartida
+            block = dim3(TILE_SIZE, TILE_SIZE);
+            grid = dim3((n + TILE_SIZE - 1) / TILE_SIZE,
+                       (n + TILE_SIZE - 1) / TILE_SIZE);
+            matmul_gpu_sm<<<grid, block>>>(d_A, d_B, d_C, n);
+        }
+        
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        
+        float tiempo_ms = 0.0;
+        CUDA_CHECK(cudaEventElapsedTime(&tiempo_ms, start, stop));
+        tiempo_ejecucion = tiempo_ms / 1000.0;
+        
+        // Verificar errores
+        cudaError_t kernelErr = cudaGetLastError();
+        if (kernelErr != cudaSuccess) {
+            printf("ERROR CUDA: %s\n", cudaGetErrorString(kernelErr));
+        }
+        
+        // Copiar resultado
+        CUDA_CHECK(cudaMemcpy(h_C, d_C, size, cudaMemcpyDeviceToHost));
+        
+        // Liberar GPU
+        CUDA_CHECK(cudaFree(d_A));
+        CUDA_CHECK(cudaFree(d_B));
+        CUDA_CHECK(cudaFree(d_C));
+        CUDA_CHECK(cudaEventDestroy(start));
+        CUDA_CHECK(cudaEventDestroy(stop));
+        
+        printf("GPU-%d: n=%d, tiempo=%.3f ms\n", ALG, n, tiempo_ms);
     }
-
-    // Reservar memoria en el dispositivo (GPU)
-    float *d_A, *d_B, *d_C;
-    CUDA_CHECK(cudaMalloc((void**)&d_A, bytes));
-    CUDA_CHECK(cudaMalloc((void**)&d_B, bytes));
-    CUDA_CHECK(cudaMalloc((void**)&d_C, bytes));
-
-    CUDA_CHECK(cudaMemcpy(d_A, A, bytes, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_B, B, bytes, cudaMemcpyHostToDevice));
-
-    dim3 block, grid;
-
-    if (ALG == 2) {
-        // Kernel básico - escoger bloque de 16x16
-        block = dim3(16, 16);
-        grid = dim3((n + block.x - 1) / block.x, (n + block.y - 1) / block.y);
-
-        cudaEvent_t s,e; CUDA_CHECK(cudaEventCreate(&s)); CUDA_CHECK(cudaEventCreate(&e));
-        CUDA_CHECK(cudaEventRecord(s));
-        matmul_kernel_basic<<<grid, block>>>(d_A, d_B, d_C, n);
-        CUDA_CHECK(cudaEventRecord(e)); CUDA_CHECK(cudaEventSynchronize(e));
-        float ms = 0.0f; CUDA_CHECK(cudaEventElapsedTime(&ms, s, e));
-        printf("GPU basic kernel time: %.3f ms\n", ms);
-        CUDA_CHECK(cudaMemcpy(C_gpu, d_C, bytes, cudaMemcpyDeviceToHost));
-    } else if (ALG == 3) {
-        // Kernel con tiling y memoria compartida
-        block = dim3(TILE, TILE);
-        grid = dim3((n + TILE - 1) / TILE, (n + TILE - 1) / TILE);
-
-        cudaEvent_t s,e; CUDA_CHECK(cudaEventCreate(&s)); CUDA_CHECK(cudaEventCreate(&e));
-        CUDA_CHECK(cudaEventRecord(s));
-        matmul_kernel_tiled<<<grid, block>>>(d_A, d_B, d_C, n);
-        CUDA_CHECK(cudaEventRecord(e)); CUDA_CHECK(cudaEventSynchronize(e));
-        float ms = 0.0f; CUDA_CHECK(cudaEventElapsedTime(&ms, s, e));
-        printf("GPU tiled (shared) kernel time: %.3f ms\n", ms);
-        CUDA_CHECK(cudaMemcpy(C_gpu, d_C, bytes, cudaMemcpyDeviceToHost));
-    } else {
-        fprintf(stderr, "ALG debe ser 1, 2 o 3\n");
-        CUDA_CHECK(cudaFree(d_A)); CUDA_CHECK(cudaFree(d_B)); CUDA_CHECK(cudaFree(d_C));
-        free(A); free(B); free(C_ref); free(C_gpu);
-        return 1;
+    
+    // Verificar resultados si es necesario
+    if (n <= 1024 && ALG != 1) {
+        int errores = verificar_resultados(h_C, h_C_ref, n);
+        if (errores > 0) {
+            printf("  Errores: %d\n", errores);
+        }
     }
-
-    // Verificar corrección
-    int mism = comparar_matrices(C_ref, C_gpu, n);
-    if (mism == 0) printf("Resultado correcto (0 mismatches)\n");
-    else printf("Resultado INCORRECTO: %d mismatches\n", mism);
-
-    imprimir_matriz("C_GPU", C_gpu, n);
-
-    // Liberar recursos
-    CUDA_CHECK(cudaFree(d_A)); CUDA_CHECK(cudaFree(d_B)); CUDA_CHECK(cudaFree(d_C));
-    free(A); free(B); free(C_ref); free(C_gpu);
-
+    
+    // Liberar memoria CPU
+    free(h_A);
+    free(h_B);
+    free(h_C);
+    free(h_C_ref);
+    
     return 0;
 }
