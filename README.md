@@ -113,5 +113,11 @@ Reducción accesos a memoria global mediante caché
 # Conclusiones
 El análisis de rendimiento demuestra que las GPUs  proporcionan una aceleración significativa para la multiplicación de matrices, alcanzando speedups de hasta 284× sobre la implementación CPU multicore. La optimización mediante memoria compartida mejora consistentemente el rendimiento en un 4-17% respecto a la versión GPU básica, evidenciando la importancia del reuso de datos mediante tiling. Se observa que el speedup aumenta con el tamaño del problema, ya que el overhead de transferencia se vuelve menos significativo en matrices grandes. Para problemas de tamaño pequeño (n < 256), la implementación CPU mantiene competitividad debido a su menor overhead de ejecución, mientras que para problemas de mayor escala, la paralelización masiva de las GPUs resulta claramente ventajosa.
 
+# Gráficos
 <img width="1200" height="498" alt="image" src="https://github.com/user-attachments/assets/a281052d-53d1-4244-8cf2-b58a126d8d58" />
+
+
+### Observación sobre los gráficos
+Los gráficos evidencian que el rendimiento de la GPU mejora de forma más significativa a medida que aumenta el tamaño de la matriz. En particular, la versión con memoria compartida presenta un mayor speedup debido al reuso eficiente de datos mediante *tiling*, mientras que la implementación en CPU muestra una escalabilidad limitada.
+
 
